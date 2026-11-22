@@ -21,8 +21,18 @@ class DetectorBusyError(Exception):
     pass
 
 
-def detect_image(image):
-    if not _inference_lock.acquire(blocking=False):
+def detect_image(image, wait=None):
+    """Run YOLO on one BGR image.
+
+    ``wait`` (seconds) lets callers such as video processing queue for the
+    engine instead of failing immediately with ``DetectorBusyError``.
+    """
+    acquired = (
+        _inference_lock.acquire(timeout=wait)
+        if wait
+        else _inference_lock.acquire(blocking=False)
+    )
+    if not acquired:
         raise DetectorBusyError("The detection engine is busy.")
 
     try:

@@ -1,5 +1,5 @@
 from violation.inference import detect_image
 
 
-def process_image(image):
-    return detect_image(image)
+def process_image(image, wait=None):
+    return detect_image(image, wait=wait)

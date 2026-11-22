@@ -1,7 +1,8 @@
 from django.urls import path
 
-from detection_ws.views import DetectionView
+from detection_ws.views import ImageDetectionView, VideoDetectionView
 
 urlpatterns = [
-    path("", DetectionView.as_view(), name="detection"),
+    path("image/", ImageDetectionView.as_view(), name="detection-image"),
+    path("video/", VideoDetectionView.as_view(), name="detection-video"),
 ]

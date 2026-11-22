@@ -12,6 +12,7 @@ from detection_ws.image_adapter import (
     decode_image_bytes,
     encode_jpeg_base64,
 )
+from detection_ws.notifications import user_group
 from detection_ws.services.violation_service import process_image
 from violation.inference import DetectorBusyError
 
@@ -20,6 +21,8 @@ _MAX_BASE64_MESSAGE_SIZE = (settings.WEBSOCKET_MAX_IMAGE_SIZE + 2) // 3 * 4 + 40
 
 
 class DetectionConsumer(AsyncWebsocketConsumer):
+    group_name = None
+
     async def connect(self):
         if not self.scope["user"].is_authenticated:
             await self.close(code=4401)
@@ -28,6 +31,17 @@ class DetectionConsumer(AsyncWebsocketConsumer):
             await self.accept(subprotocol="bearer")
         else:
             await self.accept()
+        # Receive alerts produced by this user's REST uploads (photo/vidéo).
+        if self.channel_layer is not None:
+            self.group_name = user_group(self.scope["user"].pk)
+            await self.channel_layer.group_add(self.group_name, self.channel_name)
+
+    async def disconnect(self, code):
+        if self.group_name and self.channel_layer is not None:
+            await self.channel_layer.group_discard(self.group_name, self.channel_name)
+
+    async def detection_push(self, event):
+        await self.send(text_data=json.dumps(event["payload"]))
 
     async def receive(self, text_data=None, bytes_data=None):
         try:

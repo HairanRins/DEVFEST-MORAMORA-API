@@ -9,8 +9,12 @@ import os
 
 _DESCRIPTION = """
 API **MoraMora** : authentification JWT (REST) et détection d'infractions
-YOLOv8, en REST (`POST /api/detection/`, testable ici) ou en temps réel via
-WebSocket (`/ws/detection/`, non testable dans Swagger : voir ci-dessous).
+YOLOv8, par upload REST (`POST /api/detection/image/` et
+`POST /api/detection/video/`, testables ici) ou en temps réel via WebSocket
+(`/ws/detection/`, non testable dans Swagger : voir ci-dessous).
+
+Les deux sont reliés : un WebSocket ouvert reçoit aussi les alertes des photos
+et vidéos uploadées en REST par le même utilisateur.
 
 ## Authentification
 
@@ -51,7 +55,11 @@ Limites : 5 Mio et 20 mégapixels par image (configurables).
 **Serveur → client**
 
 - `WsDetectionResult` : image annotée (JPEG base64) + détections ;
-- `WsAlert` : envoyé juste après le résultat si au moins une détection ;
+- `WsAlert` : envoyé juste après le résultat si au moins une détection.
+  Aussi envoyé pour les uploads REST de l'utilisateur : `source` vaut alors
+  `image_upload` ou `video_upload` (avec `frame` et `timestamp`) et `upload_id`
+  correspond à la réponse HTTP ;
+- `WsVideoCompleted` : fin d'analyse d'une vidéo uploadée (résumé) ;
 - `WsError` : `code` = `invalid_image` | `busy` | `processing_error`.
   `busy` signifie qu'une inférence est déjà en cours : réessayer.
 
@@ -63,7 +71,8 @@ socket.onopen = () => socket.send(JSON.stringify({ type: "image", image: dataUrl
 socket.onmessage = ({ data }) => {
   const msg = JSON.parse(data);
   if (msg.type === "detection_result") show(msg.data.image, msg.data.detections);
-  if (msg.type === "alert") notify(msg.data.detections);
+  if (msg.type === "alert") notify(msg.data.detections); // live ou upload REST
+  if (msg.type === "video_completed") done(msg.upload_id, msg.data.summary);
   if (msg.type === "error") console.warn(msg.code, msg.message);
 };
 ```
@@ -143,18 +152,57 @@ _WEBSOCKET_COMPONENTS = {
                     "type": "string",
                     "example": "A violation has been detected",
                 },
+                "source": {
+                    "type": "string",
+                    "enum": ["image_upload", "video_upload"],
+                    "description": "Absent pour une image envoyée sur le WebSocket.",
+                },
+                "upload_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "Présent pour les uploads REST.",
+                },
                 "data": {
                     "type": "object",
                     "properties": {
                         "detections": {
                             "type": "array",
                             "items": {"$ref": "#/components/schemas/WsDetection"},
-                        }
+                        },
+                        "frame": {
+                            "type": "integer",
+                            "description": "Vidéo uniquement : index de l'image.",
+                        },
+                        "timestamp": {
+                            "type": "number",
+                            "description": "Vidéo uniquement : position en secondes.",
+                        },
                     },
                     "required": ["detections"],
                 },
             },
             "required": ["type", "event", "message", "data"],
+        },
+        "WsVideoCompleted": {
+            "type": "object",
+            "description": "Fin d'analyse d'une vidéo envoyée via POST /api/detection/video/.",
+            "properties": {
+                "type": {"type": "string", "enum": ["video_completed"]},
+                "upload_id": {"type": "string", "format": "uuid"},
+                "data": {
+                    "type": "object",
+                    "properties": {
+                        "video": {"$ref": "#/components/schemas/VideoMetadata"},
+                        "frames_analyzed": {"type": "integer"},
+                        "alert": {"type": "boolean"},
+                        "summary": {
+                            "type": "object",
+                            "additionalProperties": {"type": "integer"},
+                        },
+                    },
+                },
+            },
+            "required": ["type", "upload_id", "data"],
         },
         "WsError": {
             "type": "object",
@@ -184,7 +232,7 @@ SPECTACULAR_SETTINGS = {
         {"name": "Authentification", "description": "Comptes et JWT."},
         {
             "name": "Détection",
-            "description": "Détection d'infractions YOLOv8 (REST). "
+            "description": "Upload de photos et vidéos analysées par YOLOv8. "
             "Le flux temps réel passe par le WebSocket /ws/detection/ "
             "décrit en haut de page.",
         },

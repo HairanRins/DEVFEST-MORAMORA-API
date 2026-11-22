@@ -5,8 +5,12 @@ info:
   description: |2
 
     API **MoraMora** : authentification JWT (REST) et détection d'infractions
-    YOLOv8, en REST (`POST /api/detection/`, testable ici) ou en temps réel via
-    WebSocket (`/ws/detection/`, non testable dans Swagger : voir ci-dessous).
+    YOLOv8, par upload REST (`POST /api/detection/image/` et
+    `POST /api/detection/video/`, testables ici) ou en temps réel via WebSocket
+    (`/ws/detection/`, non testable dans Swagger : voir ci-dessous).
+
+    Les deux sont reliés : un WebSocket ouvert reçoit aussi les alertes des photos
+    et vidéos uploadées en REST par le même utilisateur.
 
     ## Authentification
 
@@ -47,7 +51,11 @@ info:
     **Serveur → client**
 
     - `WsDetectionResult` : image annotée (JPEG base64) + détections ;
-    - `WsAlert` : envoyé juste après le résultat si au moins une détection ;
+    - `WsAlert` : envoyé juste après le résultat si au moins une détection.
+      Aussi envoyé pour les uploads REST de l'utilisateur : `source` vaut alors
+      `image_upload` ou `video_upload` (avec `frame` et `timestamp`) et `upload_id`
+      correspond à la réponse HTTP ;
+    - `WsVideoCompleted` : fin d'analyse d'une vidéo uploadée (résumé) ;
     - `WsError` : `code` = `invalid_image` | `busy` | `processing_error`.
       `busy` signifie qu'une inférence est déjà en cours : réessayer.
 
@@ -59,7 +67,8 @@ info:
     socket.onmessage = ({ data }) => {
       const msg = JSON.parse(data);
       if (msg.type === "detection_result") show(msg.data.image, msg.data.detections);
-      if (msg.type === "alert") notify(msg.data.detections);
+      if (msg.type === "alert") notify(msg.data.detections); // live ou upload REST
+      if (msg.type === "video_completed") done(msg.upload_id, msg.data.summary);
       if (msg.type === "error") console.warn(msg.code, msg.message);
     };
     ```
@@ -196,20 +205,21 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
           description: Données invalides.
-  /api/detection/:
+  /api/detection/image/:
     post:
-      operationId: detection_create
-      description: 'Équivalent REST du WebSocket `/ws/detection/` : envoie une image
-        (multipart, champ `image`) et reçoit l''image annotée + les détections YOLOv8.
-        Pour un flux temps réel (caméra), utiliser le WebSocket.'
-      summary: Détecter les infractions sur une image
+      operationId: detection_image_create
+      description: 'Envoie une photo (multipart, champ `image`) et renvoie l''image
+        annotée + les détections YOLOv8. Si une infraction est détectée, un message
+        `alert` (`source: "image_upload"`) est aussi envoyé aux WebSockets `/ws/detection/`
+        ouverts par le même utilisateur.'
+      summary: Analyser une photo
       tags:
       - Détection
       requestBody:
         content:
           multipart/form-data:
             schema:
-              $ref: '#/components/schemas/DetectionUploadRequest'
+              $ref: '#/components/schemas/ImageUploadRequest'
         required: true
       security:
       - bearerAuth: []
@@ -218,7 +228,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DetectionResponse'
+                $ref: '#/components/schemas/ImageDetectionResponse'
           description: ''
         '400':
           content:
@@ -226,6 +236,55 @@ paths:
               schema:
                 $ref: '#/components/schemas/DetectionErrorResponse'
           description: Image absente ou invalide.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: JWT absent, invalide ou révoqué.
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetectionErrorResponse'
+          description: 'Moteur occupé (`busy`) : réessayer.'
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetectionErrorResponse'
+          description: Erreur pendant l'inférence.
+  /api/detection/video/:
+    post:
+      operationId: detection_video_create
+      description: |-
+        Envoie une vidéo (multipart, champ `video`). Le serveur analyse `sample_fps` images par seconde (120 images max) et renvoie, pour chaque image contenant une infraction, son horodatage, ses détections et l'image annotée.
+
+        **Temps réel via WebSocket** : pendant le traitement, chaque infraction est envoyée aux WebSockets `/ws/detection/` de l'utilisateur (`alert`, `source: "video_upload"`, avec `frame` et `timestamp`), puis un message `video_completed` signale la fin. Le traitement est synchrone : la requête HTTP dure le temps de l'analyse.
+      summary: Analyser une vidéo
+      tags:
+      - Détection
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/VideoUploadRequest'
+        required: true
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VideoDetectionResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetectionErrorResponse'
+          description: Vidéo absente ou invalide.
         '401':
           content:
             application/json:
@@ -260,35 +319,6 @@ paths:
           description: ''
 components:
   schemas:
-    CodeEnum:
-      enum:
-      - invalid_image
-      - busy
-      - processing_error
-      type: string
-      description: |-
-        * `invalid_image` - invalid_image
-        * `busy` - busy
-        * `processing_error` - processing_error
-    DetectionData:
-      type: object
-      properties:
-        image:
-          type: string
-          description: Image annotée, JPEG encodé en base64.
-        detections:
-          type: array
-          items:
-            type: object
-            additionalProperties: {}
-          description: Liste de détections (voir le schéma WsDetection).
-        alert:
-          type: boolean
-          description: true si au moins une infraction est détectée.
-      required:
-      - alert
-      - detections
-      - image
     DetectionErrorResponse:
       type: object
       properties:
@@ -296,34 +326,24 @@ components:
           type: boolean
           default: false
         code:
-          $ref: '#/components/schemas/CodeEnum'
+          $ref: '#/components/schemas/DetectionErrorResponseCodeEnum'
         message:
           type: string
       required:
       - code
       - message
-    DetectionResponse:
-      type: object
-      properties:
-        success:
-          type: boolean
-          default: true
-        message:
-          type: string
-          default: Image processed successfully
-        data:
-          $ref: '#/components/schemas/DetectionData'
-      required:
-      - data
-    DetectionUploadRequest:
-      type: object
-      properties:
-        image:
-          type: string
-          format: binary
-          description: Image JPEG ou PNG (5 Mio max).
-      required:
-      - image
+    DetectionErrorResponseCodeEnum:
+      enum:
+      - invalid_image
+      - invalid_video
+      - busy
+      - processing_error
+      type: string
+      description: |-
+        * `invalid_image` - invalid_image
+        * `invalid_video` - invalid_video
+        * `busy` - busy
+        * `processing_error` - processing_error
     ErrorResponse:
       type: object
       properties:
@@ -348,6 +368,52 @@ components:
         status:
           type: string
           default: ok
+    ImageDetectionData:
+      type: object
+      properties:
+        detections:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+          description: Détections (format du schéma WsDetection).
+        upload_id:
+          type: string
+          format: uuid
+          description: Identifiant repris dans les messages WebSocket.
+        image:
+          type: string
+          description: Image annotée, JPEG encodé en base64.
+        alert:
+          type: boolean
+          description: true si au moins une infraction est détectée.
+      required:
+      - alert
+      - detections
+      - image
+      - upload_id
+    ImageDetectionResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          default: true
+        message:
+          type: string
+          default: Image processed successfully
+        data:
+          $ref: '#/components/schemas/ImageDetectionData'
+      required:
+      - data
+    ImageUploadRequest:
+      type: object
+      properties:
+        image:
+          type: string
+          format: binary
+          description: Photo JPEG ou PNG (5 Mio max).
+      required:
+      - image
     LoginData:
       type: object
       properties:
@@ -478,6 +544,11 @@ components:
           $ref: '#/components/schemas/UserSummary'
       required:
       - data
+    SourceEnum:
+      type: string
+      enum:
+      - image_upload
+      - video_upload
     UserSummary:
       type: object
       properties:
@@ -499,6 +570,115 @@ components:
       - email
       - id
       - username
+    VideoDetectionData:
+      type: object
+      properties:
+        upload_id:
+          type: string
+          format: uuid
+        video:
+          $ref: '#/components/schemas/VideoMetadata'
+        sample_fps:
+          type: number
+          format: double
+        frames_analyzed:
+          type: integer
+        alert:
+          type: boolean
+        summary:
+          type: object
+          additionalProperties:
+            type: integer
+          description: 'Nombre de détections par label, ex. {"no_helmet": 4}.'
+        violations:
+          type: array
+          items:
+            $ref: '#/components/schemas/VideoViolationFrame'
+          description: Images analysées contenant au moins une infraction.
+      required:
+      - alert
+      - frames_analyzed
+      - sample_fps
+      - summary
+      - upload_id
+      - video
+      - violations
+    VideoDetectionResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          default: true
+        message:
+          type: string
+          default: Video processed successfully
+        data:
+          $ref: '#/components/schemas/VideoDetectionData'
+      required:
+      - data
+    VideoMetadata:
+      type: object
+      properties:
+        duration:
+          type: number
+          format: double
+          description: Secondes.
+        fps:
+          type: number
+          format: double
+        frame_count:
+          type: integer
+        width:
+          type: integer
+        height:
+          type: integer
+      required:
+      - duration
+      - fps
+      - frame_count
+      - height
+      - width
+    VideoUploadRequest:
+      type: object
+      properties:
+        video:
+          type: string
+          format: binary
+          description: Vidéo MP4, MOV, AVI ou WebM (50 Mio et 120 s max par défaut).
+        sample_fps:
+          type: number
+          format: double
+          maximum: 10
+          minimum: 0.1
+          description: 'Images analysées par seconde de vidéo (défaut : 1).'
+      required:
+      - video
+    VideoViolationFrame:
+      type: object
+      properties:
+        detections:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+          description: Détections (format du schéma WsDetection).
+        frame:
+          type: integer
+          description: Index de l'image dans la vidéo.
+        timestamp:
+          type: number
+          format: double
+          description: Position en secondes.
+        image:
+          type: string
+          nullable: true
+          description: Image annotée (JPEG base64) ; null au-delà de DETECTION_VIDEO_MAX_ANNOTATED_FRAMES
+            images.
+      required:
+      - detections
+      - frame
+      - image
+      - timestamp
     WsAlert:
       type: object
       properties:
@@ -509,6 +689,14 @@ components:
         message:
           type: string
           example: A violation has been detected
+        source:
+          allOf:
+          - $ref: '#/components/schemas/SourceEnum'
+          description: Absent pour une image envoyée sur le WebSocket.
+        upload_id:
+          type: string
+          format: uuid
+          description: Présent pour les uploads REST.
         data:
           type: object
           properties:
@@ -516,6 +704,12 @@ components:
               type: array
               items:
                 $ref: '#/components/schemas/WsDetection'
+            frame:
+              type: integer
+              description: 'Vidéo uniquement : index de l''image.'
+            timestamp:
+              type: number
+              description: 'Vidéo uniquement : position en secondes.'
           required:
           - detections
       required:
@@ -611,7 +805,7 @@ components:
         success:
           $ref: '#/components/schemas/WsErrorSuccessEnum'
         code:
-          $ref: '#/components/schemas/CodeEnum'
+          $ref: '#/components/schemas/WsErrorCodeEnum'
         message:
           type: string
       required:
@@ -619,6 +813,12 @@ components:
       - success
       - code
       - message
+    WsErrorCodeEnum:
+      type: string
+      enum:
+      - invalid_image
+      - busy
+      - processing_error
     WsErrorSuccessEnum:
       type: boolean
       enum:
@@ -643,6 +843,36 @@ components:
       type: string
       enum:
       - image
+    WsVideoCompleted:
+      type: object
+      description: Fin d'analyse d'une vidéo envoyée via POST /api/detection/video/.
+      properties:
+        type:
+          $ref: '#/components/schemas/WsVideoCompletedTypeEnum'
+        upload_id:
+          type: string
+          format: uuid
+        data:
+          type: object
+          properties:
+            video:
+              $ref: '#/components/schemas/VideoMetadata'
+            frames_analyzed:
+              type: integer
+            alert:
+              type: boolean
+            summary:
+              type: object
+              additionalProperties:
+                type: integer
+      required:
+      - type
+      - upload_id
+      - data
+    WsVideoCompletedTypeEnum:
+      type: string
+      enum:
+      - video_completed
   securitySchemes:
     bearerAuth:
       type: http
@@ -654,7 +884,7 @@ tags:
 - name: Authentification
   description: Comptes et JWT.
 - name: Détection
-  description: Détection d'infractions YOLOv8 (REST). Le flux temps réel passe par
-    le WebSocket /ws/detection/ décrit en haut de page.
+  description: Upload de photos et vidéos analysées par YOLOv8. Le flux temps réel
+    passe par le WebSocket /ws/detection/ décrit en haut de page.
 - name: Système
   description: Supervision du service.

@@ -389,8 +389,27 @@ class DetectionWebSocketTests(TransactionTestCase):
         self.assertTrue(all(result[0] for result in results))
 
 
-class DetectionRestTests(TransactionTestCase):
-    url = "/api/detection/"
+
+def make_video(frames=10, fps=5, size=(32, 32)):
+    """Encode a tiny MP4 (mp4v) and return its bytes."""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4") as handle:
+        writer = cv2.VideoWriter(
+            handle.name, cv2.VideoWriter_fourcc(*"mp4v"), fps, size
+        )
+        for index in range(frames):
+            writer.write(np.full((size[1], size[0], 3), index * 20, dtype=np.uint8))
+        writer.release()
+        return Path(handle.name).read_bytes()
+
+
+@override_settings(
+    CHANNEL_LAYERS={"default": {"BACKEND": "channels.layers.InMemoryChannelLayer"}}
+)
+class DetectionUploadTests(TransactionTestCase):
+    image_url = "/api/detection/image/"
+    video_url = "/api/detection/video/"
 
     def setUp(self):
         from rest_framework.test import APIClient
@@ -400,40 +419,50 @@ class DetectionRestTests(TransactionTestCase):
             email="rest@example.com",
             password="Secure-password-951!",
         )
-        token = UnlimitedAccessToken.for_user(self.user)
-        IssuedAccessToken.objects.create(jti=token["jti"], user=self.user)
+        self.token = UnlimitedAccessToken.for_user(self.user)
+        IssuedAccessToken.objects.create(jti=self.token["jti"], user=self.user)
         self.client = APIClient()
-        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.token}")
 
-    def upload(self, content, name="image.png"):
+    def upload(self, url, field, content, name, **extra):
         from django.core.files.uploadedfile import SimpleUploadedFile
 
         return self.client.post(
-            self.url,
-            {"image": SimpleUploadedFile(name, content)},
+            url,
+            {field: SimpleUploadedFile(name, content), **extra},
             format="multipart",
         )
+
+    def upload_image(self, content=None):
+        content = DetectionWebSocketTests.make_png() if content is None else content
+        return self.upload(self.image_url, "image", content, "image.png")
+
+    def upload_video(self, content=None, **extra):
+        content = make_video() if content is None else content
+        return self.upload(self.video_url, "video", content, "clip.mp4", **extra)
 
     def test_requires_authentication(self):
         from rest_framework.test import APIClient
 
-        response = APIClient().post(self.url, {}, format="multipart")
-        self.assertEqual(response.status_code, 401)
+        for url in (self.image_url, self.video_url):
+            response = APIClient().post(url, {}, format="multipart")
+            self.assertEqual(response.status_code, 401)
 
     def test_image_returns_annotation_and_detections(self):
         with patch.object(inference, "load_model", return_value=FakeModel()):
-            response = self.upload(DetectionWebSocketTests.make_png())
+            response = self.upload_image()
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertTrue(body["success"])
         self.assertTrue(body["data"]["alert"])
+        self.assertTrue(body["data"]["upload_id"])
         self.assertEqual(body["data"]["detections"][0]["label"], "violation")
         self.assertTrue(base64.b64decode(body["data"]["image"]))
 
     def test_missing_or_invalid_image_returns_400(self):
-        response = self.client.post(self.url, {}, format="multipart")
+        response = self.client.post(self.image_url, {}, format="multipart")
         self.assertEqual(response.status_code, 400)
-        response = self.upload(b"not an image")
+        response = self.upload_image(b"not an image")
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["code"], "invalid_image")
 
@@ -442,6 +471,88 @@ class DetectionRestTests(TransactionTestCase):
             "detection_ws.views.process_image",
             side_effect=inference.DetectorBusyError("busy"),
         ):
-            response = self.upload(DetectionWebSocketTests.make_png())
+            response = self.upload_image()
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["code"], "busy")
+
+    def test_video_is_sampled_and_returns_violations(self):
+        with patch.object(inference, "load_model", return_value=FakeModel()):
+            response = self.upload_video(sample_fps="1")
+        self.assertEqual(response.status_code, 200, response.content)
+        data = response.json()["data"]
+        self.assertEqual(data["video"]["fps"], 5.0)
+        # 10 frames at 5 fps sampled at 1 fps -> frames 0 and 5.
+        self.assertEqual(data["frames_analyzed"], 2)
+        self.assertEqual([v["frame"] for v in data["violations"]], [0, 5])
+        self.assertEqual(data["violations"][1]["timestamp"], 1.0)
+        self.assertEqual(data["summary"], {"violation": 2})
+        self.assertTrue(data["alert"])
+        self.assertTrue(base64.b64decode(data["violations"][0]["image"]))
+
+    def test_annotated_video_frames_are_capped(self):
+        with override_settings(DETECTION_VIDEO_MAX_ANNOTATED_FRAMES=1):
+            with patch.object(inference, "load_model", return_value=FakeModel()):
+                response = self.upload_video(sample_fps="5")
+        violations = response.json()["data"]["violations"]
+        self.assertEqual(len(violations), 10)
+        self.assertIsNotNone(violations[0]["image"])
+        self.assertIsNone(violations[1]["image"])
+
+    def test_invalid_videos_return_400(self):
+        response = self.client.post(self.video_url, {}, format="multipart")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["code"], "invalid_video")
+
+        response = self.upload_video(b"not a video at all")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["code"], "invalid_video")
+
+        with override_settings(DETECTION_MAX_VIDEO_DURATION=1):
+            response = self.upload_video()
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("duration", response.json()["message"])
+
+        with override_settings(DETECTION_MAX_VIDEO_SIZE=10):
+            response = self.upload_video()
+        self.assertEqual(response.status_code, 400)
+
+        response = self.upload_video(sample_fps="0")
+        self.assertEqual(response.status_code, 400)
+
+    def test_uploads_push_alerts_to_the_users_websocket(self):
+        from asgiref.sync import sync_to_async
+
+        async def run():
+            communicator = WebsocketCommunicator(
+                application,
+                "/ws/detection/",
+                headers=[(b"origin", b"http://localhost:3000")],
+                subprotocols=["bearer", str(self.token)],
+            )
+            connected, _ = await communicator.connect()
+            self.assertTrue(connected)
+            image_response = await sync_to_async(self.upload_image)()
+            image_alert = await communicator.receive_json_from(timeout=5)
+            video_response = await sync_to_async(self.upload_video)(sample_fps="1")
+            messages = [
+                await communicator.receive_json_from(timeout=5) for _ in range(3)
+            ]
+            await communicator.disconnect()
+            return image_response, image_alert, video_response, messages
+
+        with patch.object(inference, "load_model", return_value=FakeModel()):
+            image_response, image_alert, video_response, messages = async_to_sync(
+                run
+            )()
+
+        self.assertEqual(image_alert["type"], "alert")
+        self.assertEqual(image_alert["source"], "image_upload")
+        self.assertEqual(
+            image_alert["upload_id"], image_response.json()["data"]["upload_id"]
+        )
+        video_id = video_response.json()["data"]["upload_id"]
+        self.assertEqual([m["type"] for m in messages], ["alert", "alert", "video_completed"])
+        self.assertEqual(messages[1]["source"], "video_upload")
+        self.assertEqual(messages[1]["data"]["timestamp"], 1.0)
+        self.assertTrue(all(m["upload_id"] == video_id for m in messages))
+        self.assertEqual(messages[2]["data"]["summary"], {"violation": 2})
