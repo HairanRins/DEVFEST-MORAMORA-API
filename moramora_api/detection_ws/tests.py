@@ -41,7 +41,7 @@ class FakeBoxes:
 
 class FakeResult:
     boxes = FakeBoxes()
-    names = {0: "violation"}
+    names = {0: "without_helmet"}
 
     def __init__(self, image):
         self.image = image
@@ -51,7 +51,7 @@ class FakeResult:
 
 
 class FakeModel:
-    def predict(self, source, conf, verbose):
+    def predict(self, source, conf, verbose, **options):
         return [FakeResult(source)]
 
 
@@ -207,7 +207,7 @@ class DetectionWebSocketTests(TransactionTestCase):
             result, alert = async_to_sync(run)()
 
         self.assertEqual(result["type"], "detection_result")
-        self.assertEqual(result["data"]["detections"][0]["label"], "violation")
+        self.assertEqual(result["data"]["detections"][0]["label"], "without_helmet")
         self.assertEqual(result["data"]["detections"][0]["bbox"]["x2"], 8.0)
         annotated = cv2.imdecode(
             np.frombuffer(
@@ -456,7 +456,7 @@ class DetectionUploadTests(TransactionTestCase):
         self.assertTrue(body["success"])
         self.assertTrue(body["data"]["alert"])
         self.assertTrue(body["data"]["upload_id"])
-        self.assertEqual(body["data"]["detections"][0]["label"], "violation")
+        self.assertEqual(body["data"]["detections"][0]["label"], "without_helmet")
         self.assertTrue(base64.b64decode(body["data"]["image"]))
 
     def test_missing_or_invalid_image_returns_400(self):
@@ -481,22 +481,82 @@ class DetectionUploadTests(TransactionTestCase):
         self.assertEqual(response.status_code, 200, response.content)
         data = response.json()["data"]
         self.assertEqual(data["video"]["fps"], 5.0)
-        # 10 frames at 5 fps sampled at 1 fps -> frames 0 and 5.
-        self.assertEqual(data["frames_analyzed"], 2)
-        self.assertEqual([v["frame"] for v in data["violations"]], [0, 5])
-        self.assertEqual(data["violations"][1]["timestamp"], 1.0)
-        self.assertEqual(data["summary"], {"violation": 2})
+        # 10 frames at 5 fps sampled at 1 fps -> frames 0 and 5, then the
+        # second pass around the incident at 2 fps -> frames 2, 4, 6 and 8.
+        self.assertEqual(data["frames_analyzed"], 6)
+        self.assertEqual(
+            [v["frame"] for v in data["violations"]], [0, 2, 4, 5, 6, 8]
+        )
+        self.assertEqual(data["violations"][3]["timestamp"], 1.0)
+        self.assertIsNone(data["violations"][0]["image"])
+        # The same rider in every frame: one incident, one person.
+        self.assertEqual(data["summary"], {"without_helmet": 1})
+        self.assertEqual(len(data["incidents"]), 1)
+        incident = data["incidents"][0]
+        self.assertEqual(incident["counts"], {"without_helmet": 1})
+        self.assertEqual((incident["start"], incident["end"]), (0.0, 1.6))
+        self.assertEqual(len(incident["detections"]), 1)
         self.assertTrue(data["alert"])
-        self.assertTrue(base64.b64decode(data["violations"][0]["image"]))
+        self.assertTrue(base64.b64decode(incident["image"]))
 
     def test_annotated_video_frames_are_capped(self):
-        with override_settings(DETECTION_VIDEO_MAX_ANNOTATED_FRAMES=1):
+        with override_settings(DETECTION_VIDEO_MAX_ANNOTATED_FRAMES=0):
             with patch.object(inference, "load_model", return_value=FakeModel()):
                 response = self.upload_video(sample_fps="5")
-        violations = response.json()["data"]["violations"]
-        self.assertEqual(len(violations), 10)
-        self.assertIsNotNone(violations[0]["image"])
-        self.assertIsNone(violations[1]["image"])
+        data = response.json()["data"]
+        self.assertEqual(len(data["violations"]), 10)
+        self.assertEqual(len(data["incidents"]), 1)
+        self.assertIsNone(data["incidents"][0]["image"])
+
+    def test_weak_isolated_detection_is_not_reported(self):
+        class WeakOnce(FakeModel):
+            calls = 0
+
+            def predict(self, source, conf, verbose, **options):
+                WeakOnce.calls += 1
+                result = FakeResult(source)
+                if WeakOnce.calls > 1:
+                    result.boxes = type("NoBoxes", (), {
+                        "xyxy": FakeTensor([]),
+                        "cls": FakeTensor([]),
+                        "conf": FakeTensor([]),
+                    })()
+                else:
+                    result.boxes = type("WeakBoxes", (), {
+                        "xyxy": FakeTensor([[1.0, 2.0, 8.0, 9.0]]),
+                        "cls": FakeTensor([0]),
+                        "conf": FakeTensor([0.4]),
+                    })()
+                return [result]
+
+        with patch.object(inference, "load_model", return_value=WeakOnce()):
+            response = self.upload_video(sample_fps="1")
+        data = response.json()["data"]
+        self.assertFalse(data["alert"])
+        self.assertEqual(data["summary"], {})
+        self.assertEqual(data["incidents"], [])
+        self.assertEqual(data["violations"], [])
+
+    @skipUnless(
+        os.getenv("RUN_MODEL_INTEGRATION_TESTS") == "1",
+        "Set RUN_MODEL_INTEGRATION_TESTS=1 to run the real YOLO integration.",
+    )
+    def test_real_model_counts_people_in_test_video(self):
+        """violation/test.mp4: three bareheaded riders on one motorbike."""
+        content = (
+            Path(settings.BASE_DIR.parent) / "violation" / "test.mp4"
+        ).read_bytes()
+        for sample_fps in ("0.5", "1", "2"):
+            with self.subTest(sample_fps=sample_fps):
+                response = self.upload_video(content, sample_fps=sample_fps)
+                self.assertEqual(response.status_code, 200, response.content)
+                data = response.json()["data"]
+                self.assertEqual(
+                    data["summary"],
+                    {"more_than_two_persons": 1, "without_helmet": 3},
+                )
+                self.assertEqual(len(data["incidents"]), 1)
+                self.assertTrue(base64.b64decode(data["incidents"][0]["image"]))
 
     def test_invalid_videos_return_400(self):
         response = self.client.post(self.video_url, {}, format="multipart")
@@ -535,7 +595,7 @@ class DetectionUploadTests(TransactionTestCase):
             image_alert = await communicator.receive_json_from(timeout=5)
             video_response = await sync_to_async(self.upload_video)(sample_fps="1")
             messages = [
-                await communicator.receive_json_from(timeout=5) for _ in range(3)
+                await communicator.receive_json_from(timeout=5) for _ in range(7)
             ]
             await communicator.disconnect()
             return image_response, image_alert, video_response, messages
@@ -551,8 +611,12 @@ class DetectionUploadTests(TransactionTestCase):
             image_alert["upload_id"], image_response.json()["data"]["upload_id"]
         )
         video_id = video_response.json()["data"]["upload_id"]
-        self.assertEqual([m["type"] for m in messages], ["alert", "alert", "video_completed"])
+        # Frames 0 and 5, then the second pass (2, 4, 6, 8), then the end.
+        self.assertEqual([m["type"] for m in messages], ["alert"] * 6 + ["video_completed"])
         self.assertEqual(messages[1]["source"], "video_upload")
         self.assertEqual(messages[1]["data"]["timestamp"], 1.0)
         self.assertTrue(all(m["upload_id"] == video_id for m in messages))
-        self.assertEqual(messages[2]["data"]["summary"], {"violation": 2})
+        completed = messages[6]["data"]
+        self.assertEqual(completed["summary"], {"without_helmet": 1})
+        self.assertEqual(completed["incidents"][0]["counts"], {"without_helmet": 1})
+        self.assertIsNone(completed["incidents"][0]["image"])

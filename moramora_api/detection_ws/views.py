@@ -9,8 +9,8 @@ import logging
 import os
 import tempfile
 import uuid
-from collections import Counter
 
+import cv2
 from django.conf import settings
 from drf_spectacular.utils import OpenApiResponse, extend_schema, inline_serializer
 from rest_framework import serializers, status
@@ -23,14 +23,17 @@ from authentication.openapi import UNAUTHORIZED
 from detection_ws.image_adapter import (
     InvalidImageError,
     decode_image_bytes,
+    draw_detections,
     encode_jpeg_base64,
 )
 from detection_ws.notifications import notify_user
+from detection_ws.services import video_rules
 from detection_ws.services.violation_service import process_image
 from detection_ws.video_adapter import (
     InvalidVideoError,
     VideoReader,
     check_video_signature,
+    read_frames,
 )
 from violation.inference import DetectorBusyError
 
@@ -38,6 +41,14 @@ logger = logging.getLogger(__name__)
 
 # Seconds a video frame may wait for the engine (shared with WebSocket clients).
 _VIDEO_FRAME_WAIT = 30
+# Video inference returns low-confidence candidates (filtered per class by
+# video_rules) and keeps one class per object.
+_VIDEO_INFERENCE = {
+    "conf": video_rules.INFERENCE_CONFIDENCE,
+    "iou": 0.5,
+    "agnostic_nms": True,
+    "annotate": False,
+}
 
 
 # --------------------------------------------------------------------------
@@ -113,7 +124,36 @@ VideoDetectionResponseSerializer = inline_serializer(
                 "alert": serializers.BooleanField(),
                 "summary": serializers.DictField(
                     child=serializers.IntegerField(),
-                    help_text="Nombre de détections par label, ex. {\"no_helmet\": 4}.",
+                    help_text="Personnes (ou véhicules) en infraction par label, "
+                    "confirmées et additionnées sur les incidents, "
+                    "ex. {\"without_helmet\": 3}.",
+                ),
+                "incidents": serializers.ListField(
+                    child=inline_serializer(
+                        name="VideoIncident",
+                        fields={
+                            "start": serializers.FloatField(help_text="Secondes."),
+                            "end": serializers.FloatField(help_text="Secondes."),
+                            "frames": serializers.IntegerField(
+                                help_text="Images analysées en infraction."
+                            ),
+                            "counts": serializers.DictField(
+                                child=serializers.IntegerField(),
+                                help_text="Personnes en infraction par label.",
+                            ),
+                            "key_frame": serializers.IntegerField(),
+                            "timestamp": serializers.FloatField(),
+                            "detections": _DETECTIONS_FIELD,
+                            "image": serializers.CharField(
+                                allow_null=True,
+                                help_text="Image clé annotée (JPEG base64) ; null "
+                                "au-delà de DETECTION_VIDEO_MAX_ANNOTATED_FRAMES "
+                                "incidents.",
+                            ),
+                        },
+                    ),
+                    help_text="Scènes continues en infraction, une entrée par "
+                    "scène (pas par image).",
                 ),
                 "violations": serializers.ListField(
                     child=inline_serializer(
@@ -128,12 +168,12 @@ VideoDetectionResponseSerializer = inline_serializer(
                             "detections": _DETECTIONS_FIELD,
                             "image": serializers.CharField(
                                 allow_null=True,
-                                help_text="Image annotée (JPEG base64) ; null au-delà "
-                                "de DETECTION_VIDEO_MAX_ANNOTATED_FRAMES images.",
+                                help_text="Toujours null : voir incidents[].image.",
                             ),
                         },
                     ),
-                    help_text="Images analysées contenant au moins une infraction.",
+                    help_text="Images des incidents (frise), limitées aux "
+                    "infractions confirmées.",
                 ),
             },
         ),
@@ -294,9 +334,11 @@ class ImageDetectionView(APIView):
     tags=["Détection"],
     summary="Analyser une vidéo",
     description="Envoie une vidéo (multipart, champ `video`). Le serveur analyse "
-    "`sample_fps` images par seconde (120 images max) et renvoie, pour chaque "
-    "image contenant une infraction, son horodatage, ses détections et l'image "
-    "annotée.\n\n"
+    "`sample_fps` images par seconde (120 images max), puis ré-analyse à 2 images/s "
+    "les alentours de chaque infraction. Les détections sont filtrées par seuil de "
+    "classe, regroupées en **incidents** (scènes continues) et confirmées sur "
+    "plusieurs images ; chaque incident compte les personnes en infraction et "
+    "porte une image clé annotée.\n\n"
     "**Temps réel via WebSocket** : pendant le traitement, chaque infraction est "
     "envoyée aux WebSockets `/ws/detection/` de l'utilisateur (`alert`, "
     "`source: \"video_upload\"`, avec `frame` et `timestamp`), puis un message "
@@ -356,39 +398,48 @@ class VideoDetectionView(APIView):
         reader = VideoReader(path, sample_fps)
 
         upload_id = str(uuid.uuid4())
-        violations = []
-        summary = Counter()
-        frames_analyzed = 0
+        observations = []
+        # Raw JPEG of each flagged frame, to draw the incident key frames.
+        snapshots = {}
+
+        def analyse(frame_index, frame):
+            timestamp = round(frame_index / reader.fps, 3)
+            _, detections = process_image(
+                frame, wait=_VIDEO_FRAME_WAIT, **_VIDEO_INFERENCE
+            )
+            detections = video_rules.filter_detections(detections)
+            observations.append(
+                video_rules.FrameObservation(frame_index, timestamp, detections)
+            )
+            violations = [d for d in detections if video_rules.is_violation(d["label"])]
+            if not violations:
+                return
+            ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            if ok:
+                snapshots[frame_index] = encoded
+            notify_user(
+                user_id,
+                _alert(
+                    upload_id,
+                    "video_upload",
+                    violations,
+                    frame=frame_index,
+                    timestamp=timestamp,
+                ),
+            )
+
         try:
-            for frame_index, timestamp, frame in reader.frames():
-                annotated, detections = process_image(frame, wait=_VIDEO_FRAME_WAIT)
-                frames_analyzed += 1
-                if not detections:
-                    continue
-                summary.update(d["label"] for d in detections)
-                image = (
-                    encode_jpeg_base64(annotated)
-                    if len(violations) < settings.DETECTION_VIDEO_MAX_ANNOTATED_FRAMES
-                    else None
-                )
-                violations.append(
-                    {
-                        "frame": frame_index,
-                        "timestamp": timestamp,
-                        "detections": detections,
-                        "image": image,
-                    }
-                )
-                notify_user(
-                    user_id,
-                    _alert(
-                        upload_id,
-                        "video_upload",
-                        detections,
-                        frame=frame_index,
-                        timestamp=timestamp,
-                    ),
-                )
+            for frame_index, _, frame in reader.frames():
+                analyse(frame_index, frame)
+            # Second pass around incidents when the sampling was sparse.
+            extra = video_rules.refinement_indices(
+                observations,
+                reader.fps,
+                reader.sample_fps,
+                settings.DETECTION_VIDEO_MAX_FRAMES - len(observations),
+            )
+            for frame_index, frame in read_frames(path, extra):
+                analyse(frame_index, frame)
         except InvalidVideoError:
             raise
         except DetectorBusyError:
@@ -396,14 +447,32 @@ class VideoDetectionView(APIView):
         except Exception:
             return _processing_error()
 
+        observations.sort(key=lambda observation: observation.frame)
+        incidents = video_rules.build_incidents(observations, reader.sample_fps)
+        for position, incident in enumerate(incidents):
+            incident["image"] = None
+            snapshot = snapshots.get(incident["key_frame"])
+            if (
+                snapshot is not None
+                and position < settings.DETECTION_VIDEO_MAX_ANNOTATED_FRAMES
+            ):
+                frame = cv2.imdecode(snapshot, cv2.IMREAD_COLOR)
+                incident["image"] = encode_jpeg_base64(
+                    draw_detections(
+                        frame, incident["detections"], video_rules.is_violation
+                    )
+                )
+
+        summary = video_rules.summarize(incidents)
         data = {
             "upload_id": upload_id,
             "video": reader.metadata(),
             "sample_fps": reader.sample_fps,
-            "frames_analyzed": frames_analyzed,
-            "alert": bool(violations),
-            "summary": dict(summary),
-            "violations": violations,
+            "frames_analyzed": len(observations),
+            "alert": bool(incidents),
+            "summary": summary,
+            "incidents": incidents,
+            "violations": video_rules.timeline(observations, incidents),
         }
         notify_user(
             user_id,
@@ -411,8 +480,14 @@ class VideoDetectionView(APIView):
                 "type": "video_completed",
                 "upload_id": upload_id,
                 "data": {
-                    key: data[key]
-                    for key in ("video", "frames_analyzed", "alert", "summary")
+                    "video": data["video"],
+                    "frames_analyzed": data["frames_analyzed"],
+                    "alert": data["alert"],
+                    "summary": summary,
+                    # Without images: the WebSocket message stays small.
+                    "incidents": [
+                        {**incident, "image": None} for incident in incidents
+                    ],
                 },
             },
         )

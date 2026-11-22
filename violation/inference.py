@@ -21,11 +21,16 @@ class DetectorBusyError(Exception):
     pass
 
 
-def detect_image(image, wait=None):
+def detect_image(
+    image, wait=None, conf=0.5, iou=0.7, agnostic_nms=False, annotate=True
+):
     """Run YOLO on one BGR image.
 
     ``wait`` (seconds) lets callers such as video processing queue for the
     engine instead of failing immediately with ``DetectorBusyError``.
+    ``agnostic_nms`` keeps a single class per object (a head cannot be both
+    with and without helmet). With ``annotate=False`` no annotated image is
+    drawn and ``None`` is returned in its place.
     """
     acquired = (
         _inference_lock.acquire(timeout=wait)
@@ -36,7 +41,13 @@ def detect_image(image, wait=None):
         raise DetectorBusyError("The detection engine is busy.")
 
     try:
-        results = load_model().predict(source=image, conf=0.5, verbose=False)
+        results = load_model().predict(
+            source=image,
+            conf=conf,
+            iou=iou,
+            agnostic_nms=agnostic_nms,
+            verbose=False,
+        )
         if not results:
             raise RuntimeError("The detection model returned no result.")
 
@@ -69,6 +80,6 @@ def detect_image(image, wait=None):
                     }
                 )
 
-        return result.plot(), detections
+        return (result.plot() if annotate else None), detections
     finally:
         _inference_lock.release()

@@ -85,3 +85,24 @@ class VideoReader:
             self.capture.release()
         if yielded == 0:
             raise InvalidVideoError("The video contains no readable frame.")
+
+
+def read_frames(path, indices):
+    """Yield ``(frame_index, frame)`` for the given frame indices, in order."""
+    wanted = sorted(set(indices))
+    if not wanted:
+        return
+    capture = cv2.VideoCapture(path)
+    try:
+        position = 0
+        for index in wanted:
+            while position < index:
+                if not capture.grab():
+                    return
+                position += 1
+            ok, frame = capture.read()
+            position += 1
+            if ok and frame is not None:
+                yield index, frame
+    finally:
+        capture.release()

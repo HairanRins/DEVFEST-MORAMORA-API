@@ -110,3 +110,36 @@ def encode_jpeg_base64(image):
     if not success:
         raise RuntimeError("The annotated image could not be encoded.")
     return base64.b64encode(encoded.tobytes()).decode("ascii")
+
+
+_VIOLATION_COLOR = (60, 60, 230)  # BGR red
+_COMPLIANT_COLOR = (90, 180, 60)  # BGR green
+
+
+def draw_detections(image, detections, is_violation):
+    """Copy of ``image`` with only the given detections drawn on it."""
+    annotated = image.copy()
+    thickness = max(2, round(max(image.shape[:2]) / 400))
+    for detection in detections:
+        box = detection["bbox"]
+        x1, y1, x2, y2 = (int(box[k]) for k in ("x1", "y1", "x2", "y2"))
+        color = _VIOLATION_COLOR if is_violation(detection["label"]) else _COMPLIANT_COLOR
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
+        text = f"{detection['label']} {detection['confidence']:.2f}"
+        scale = thickness / 4
+        (width, height), baseline = cv2.getTextSize(
+            text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1
+        )
+        top = max(0, y1 - height - baseline - 4)
+        cv2.rectangle(annotated, (x1, top), (x1 + width + 4, y1), color, -1)
+        cv2.putText(
+            annotated,
+            text,
+            (x1 + 2, y1 - baseline - 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    return annotated
