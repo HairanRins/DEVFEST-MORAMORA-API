@@ -4,8 +4,9 @@ info:
   version: 1.0.0
   description: |2
 
-    API **MoraMora** : authentification JWT (REST) et détection d'infractions en
-    temps réel (WebSocket + YOLOv8).
+    API **MoraMora** : authentification JWT (REST) et détection d'infractions
+    YOLOv8, en REST (`POST /api/detection/`, testable ici) ou en temps réel via
+    WebSocket (`/ws/detection/`, non testable dans Swagger : voir ci-dessous).
 
     ## Authentification
 
@@ -195,6 +196,54 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
           description: Données invalides.
+  /api/detection/:
+    post:
+      operationId: detection_create
+      description: 'Équivalent REST du WebSocket `/ws/detection/` : envoie une image
+        (multipart, champ `image`) et reçoit l''image annotée + les détections YOLOv8.
+        Pour un flux temps réel (caméra), utiliser le WebSocket.'
+      summary: Détecter les infractions sur une image
+      tags:
+      - Détection
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/DetectionUploadRequest'
+        required: true
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetectionResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetectionErrorResponse'
+          description: Image absente ou invalide.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: JWT absent, invalide ou révoqué.
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetectionErrorResponse'
+          description: 'Moteur occupé (`busy`) : réessayer.'
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetectionErrorResponse'
+          description: Erreur pendant l'inférence.
   /api/health/:
     get:
       operationId: health_retrieve
@@ -212,11 +261,69 @@ paths:
 components:
   schemas:
     CodeEnum:
-      type: string
       enum:
       - invalid_image
       - busy
       - processing_error
+      type: string
+      description: |-
+        * `invalid_image` - invalid_image
+        * `busy` - busy
+        * `processing_error` - processing_error
+    DetectionData:
+      type: object
+      properties:
+        image:
+          type: string
+          description: Image annotée, JPEG encodé en base64.
+        detections:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+          description: Liste de détections (voir le schéma WsDetection).
+        alert:
+          type: boolean
+          description: true si au moins une infraction est détectée.
+      required:
+      - alert
+      - detections
+      - image
+    DetectionErrorResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          default: false
+        code:
+          $ref: '#/components/schemas/CodeEnum'
+        message:
+          type: string
+      required:
+      - code
+      - message
+    DetectionResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          default: true
+        message:
+          type: string
+          default: Image processed successfully
+        data:
+          $ref: '#/components/schemas/DetectionData'
+      required:
+      - data
+    DetectionUploadRequest:
+      type: object
+      properties:
+        image:
+          type: string
+          format: binary
+          description: Image JPEG ou PNG (5 Mio max).
+      required:
+      - image
     ErrorResponse:
       type: object
       properties:
@@ -546,5 +653,8 @@ components:
 tags:
 - name: Authentification
   description: Comptes et JWT.
+- name: Détection
+  description: Détection d'infractions YOLOv8 (REST). Le flux temps réel passe par
+    le WebSocket /ws/detection/ décrit en haut de page.
 - name: Système
   description: Supervision du service.

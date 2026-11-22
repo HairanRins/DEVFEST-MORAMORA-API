@@ -8,8 +8,9 @@ reusable components (``WsImageMessage``, ``WsDetectionResult``…).
 import os
 
 _DESCRIPTION = """
-API **MoraMora** : authentification JWT (REST) et détection d'infractions en
-temps réel (WebSocket + YOLOv8).
+API **MoraMora** : authentification JWT (REST) et détection d'infractions
+YOLOv8, en REST (`POST /api/detection/`, testable ici) ou en temps réel via
+WebSocket (`/ws/detection/`, non testable dans Swagger : voir ci-dessous).
 
 ## Authentification
 
@@ -181,6 +182,12 @@ SPECTACULAR_SETTINGS = {
     "APPEND_COMPONENTS": _WEBSOCKET_COMPONENTS,
     "TAGS": [
         {"name": "Authentification", "description": "Comptes et JWT."},
+        {
+            "name": "Détection",
+            "description": "Détection d'infractions YOLOv8 (REST). "
+            "Le flux temps réel passe par le WebSocket /ws/detection/ "
+            "décrit en haut de page.",
+        },
         {"name": "Système", "description": "Supervision du service."},
     ],
     "SWAGGER_UI_SETTINGS": {

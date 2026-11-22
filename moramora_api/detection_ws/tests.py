@@ -387,3 +387,61 @@ class DetectionWebSocketTests(TransactionTestCase):
 
         results = async_to_sync(run)()
         self.assertTrue(all(result[0] for result in results))
+
+
+class DetectionRestTests(TransactionTestCase):
+    url = "/api/detection/"
+
+    def setUp(self):
+        from rest_framework.test import APIClient
+
+        self.user = User.objects.create_user(
+            username="rest-user",
+            email="rest@example.com",
+            password="Secure-password-951!",
+        )
+        token = UnlimitedAccessToken.for_user(self.user)
+        IssuedAccessToken.objects.create(jti=token["jti"], user=self.user)
+        self.client = APIClient()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+    def upload(self, content, name="image.png"):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        return self.client.post(
+            self.url,
+            {"image": SimpleUploadedFile(name, content)},
+            format="multipart",
+        )
+
+    def test_requires_authentication(self):
+        from rest_framework.test import APIClient
+
+        response = APIClient().post(self.url, {}, format="multipart")
+        self.assertEqual(response.status_code, 401)
+
+    def test_image_returns_annotation_and_detections(self):
+        with patch.object(inference, "load_model", return_value=FakeModel()):
+            response = self.upload(DetectionWebSocketTests.make_png())
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["success"])
+        self.assertTrue(body["data"]["alert"])
+        self.assertEqual(body["data"]["detections"][0]["label"], "violation")
+        self.assertTrue(base64.b64decode(body["data"]["image"]))
+
+    def test_missing_or_invalid_image_returns_400(self):
+        response = self.client.post(self.url, {}, format="multipart")
+        self.assertEqual(response.status_code, 400)
+        response = self.upload(b"not an image")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["code"], "invalid_image")
+
+    def test_busy_detector_returns_503(self):
+        with patch(
+            "detection_ws.views.process_image",
+            side_effect=inference.DetectorBusyError("busy"),
+        ):
+            response = self.upload(DetectionWebSocketTests.make_png())
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["code"], "busy")

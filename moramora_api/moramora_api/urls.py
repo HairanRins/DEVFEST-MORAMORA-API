@@ -9,6 +9,7 @@ from authentication.views import HealthView
 
 urlpatterns = [
     path("api/auth/", include("authentication.urls")),
+    path("api/detection/", include("detection_ws.urls")),
     path("api/health/", HealthView.as_view(), name="health"),
     # OpenAPI 3 schema + interactive documentation.
     path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
