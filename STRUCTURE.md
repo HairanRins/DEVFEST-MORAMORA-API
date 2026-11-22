@@ -104,7 +104,6 @@ socket.onmessage = ({ data }) => console.log(JSON.parse(data));
 | --------------------------------------------------------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | **Python 3.10+** (3.12 conseillé) + `python3-venv`        | Exécuter Django et YOLO                                                 | `sudo apt install python3 python3-venv python3-pip`                                                         |
 | **Compte Neon**                                           | Base PostgreSQL hébergée, accessible via `DATABASE_URL`                 | Garder `sslmode=require&channel_binding=require` dans l'URL                |
-| **Docker** (optionnel)                                    | Utile pour les démos, plus nécessaire pour la base ou le WebSocket     |                                                                                                             |
 | **SQLite** (repli uniquement)                             | Sans `DATABASE_URL`, pour un test local isolé                          | Inclus avec Python                                                                                          |
 | **Bibliothèques système OpenCV** (si erreur `libGL.so.1`) | Requises par `opencv-python` sur certains Linux                         | `sudo apt install libgl1 libglib2.0-0`                                                                      |
 | **Connexion Internet** (1ʳᵉ fois)                         | Télécharger les poids YOLO depuis Hugging Face et PyTorch via pip       | Plusieurs centaines de Mo pour PyTorch                                                                      |
@@ -123,9 +122,12 @@ socket.onmessage = ({ data }) => console.log(JSON.parse(data));
 | `channels[daphne]`              | WebSocket + serveur ASGI Daphne (`runserver` passe par Daphne) |
 | `channels.layers` (inclus)      | Channel layer en mémoire, sans Redis                           |
 | `ultralytics`                   | YOLOv8 (installe aussi **PyTorch**, torchvision, numpy…)       |
-| `opencv-python`                 | Décodage / encodage d'images                                   |
+| `opencv-python-headless`        | Décodage / encodage d'images (sans libGL)                      |
+| `huggingface_hub`               | Téléchargement des poids YOLO                                  |
+| `drf-spectacular`               | Schéma OpenAPI 3 + Swagger UI / ReDoc                          |
+| `whitenoise`                    | Fichiers statiques en production (Render)                      |
 
-> ⚠️ `violation/inference.py` importe `huggingface_hub`, qui n'est pas listé explicitement dans `requirements.txt`. S'il n'est pas installé par une dépendance transitive, faire : `pip install huggingface_hub`.
+> Aucun Docker ni Redis n'est requis, ni en local ni en production.
 
 ### 3.3 Procédure d'installation (Linux)
 
@@ -135,7 +137,6 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python -m pip install huggingface_hub   # si absent
 
 cp .env.example .env                     # puis renseigner DATABASE_URL (Neon)
 python manage.py migrate                 # sur l'URL directe, une seule fois
@@ -155,6 +156,11 @@ RUN_MODEL_INTEGRATION_TESTS=1 python manage.py test \
 
 Démo IA seule (depuis la racine du dépôt) : `python violation/main.py`
 
+Documentation interactive : <http://localhost:8000/api/docs/> (Swagger),
+`/api/redoc/`, schéma brut `/api/schema/`. Santé du service : `/api/health/`.
+
+Déploiement en production : voir [`DEPLOIEMENT_RENDER.md`](DEPLOIEMENT_RENDER.md).
+
 ### 3.4 Variables d'environnement (`.env`)
 
 | Variable                                                                     | Défaut                     | Description                                                    |
@@ -172,6 +178,8 @@ Démo IA seule (depuis la racine du dépôt) : `python violation/main.py`
 | `WEBSOCKET_ALLOWED_ORIGINS`                                                  | localhost:3000/5173        | Origines WebSocket autorisées                                  |
 | `WEBSOCKET_MAX_IMAGE_SIZE`                                                   | `5242880` (5 Mio)          | Taille max d'une image                                         |
 | `WEBSOCKET_MAX_IMAGE_PIXELS`                                                 | `20000000`                 | Nombre max de pixels                                           |
+| `CSRF_TRUSTED_ORIGINS`                                                       | —                          | Origines HTTPS de confiance (Render ajouté automatiquement)    |
+| `HF_HOME`, `YOLO_CONFIG_DIR`                                                 | caches utilisateur         | Emplacement des poids / config YOLO (définis sur Render)       |
 
 ### 3.5 Migration Neon
 
@@ -188,14 +196,21 @@ ne sont pas encore consommées par le code Django.
 ```
 devfest-moramora-api/
 ├── STRUCTURE.md                      # Ce document
+├── DEPLOIEMENT_RENDER.md             # Guide de déploiement Render
+├── render.yaml                       # Blueprint Render (service web Python)
+├── docs/openapi.yaml                 # Export statique du schéma OpenAPI 3
 ├── moramora_api/                     # Projet Django
 │   ├── manage.py                     # CLI Django (migrate, runserver, test…)
 │   ├── requirements.txt              # Dépendances Python
 │   ├── .env.example                  # Modèle de configuration à copier en .env
 │   ├── README.md                     # Doc API (exemples curl, WebSocket)
+│   ├── scripts/
+│   │   ├── render-build.sh           # Build Render (torch CPU, collectstatic, préchargement YOLO)
+│   │   └── render-start.sh           # migrate + Daphne sur $PORT
 │   ├── moramora_api/                 # Configuration du projet
 │   │   ├── settings.py               # Réglages (DB, JWT, CORS, Channels, limites WS)
-│   │   ├── urls.py                   # Routes HTTP → /api/auth/
+│   │   ├── urls.py                   # /api/auth/, /api/health/, /api/schema/, /api/docs/, /api/redoc/
+│   │   ├── openapi_settings.py       # Configuration drf-spectacular (+ schémas des messages WS)
 │   │   ├── asgi.py                   # Point d'entrée ASGI (HTTP + WebSocket, contrôle d'origine)
 │   │   └── wsgi.py                   # Point d'entrée WSGI (HTTP seul, non utilisé pour le WS)
 │   ├── authentication/               # App : comptes et JWT
@@ -203,7 +218,8 @@ devfest-moramora-api/
 │   │   ├── tokens.py                 # UnlimitedAccessToken (JWT sans expiration)
 │   │   ├── authentication.py         # RegisteredTokenAuthentication (JWT + vérif en base)
 │   │   ├── serializers.py            # Validation signup/login, sortie profil
-│   │   ├── views.py                  # Signup, Login, Logout, Profile
+│   │   ├── views.py                  # Signup, Login, Logout, Profile, Health (annotés OpenAPI)
+│   │   ├── openapi.py                # Schémas de réponse + schéma de sécurité Bearer
 │   │   ├── urls.py                   # signup/ login/ logout/ profile/
 │   │   ├── services.py               # revoke_all_tokens_for_user()
 │   │   ├── exceptions.py             # Format d'erreur uniforme
@@ -228,4 +244,4 @@ devfest-moramora-api/
     └── runs/detect/predict/          # Sorties générées par la démo
 ```
 
-Fichiers générés localement (non versionnés) : `moramora_api/.env`, `moramora_api/.venv/`, `moramora_api/db.sqlite3`, cache des poids `~/.cache/huggingface/`.
+Fichiers générés localement (non versionnés) : `moramora_api/.env`, `moramora_api/.venv/`, `moramora_api/db.sqlite3`, `moramora_api/staticfiles/`, cache des poids `~/.cache/huggingface/` (ou `.cache/` sur Render).

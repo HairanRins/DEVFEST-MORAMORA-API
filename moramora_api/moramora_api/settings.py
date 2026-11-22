@@ -27,6 +27,11 @@ ALLOWED_HOSTS = [
     if host.strip()
 ]
 
+# Render injects the public hostname of the service (e.g. moramora-api.onrender.com).
+RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+if RENDER_EXTERNAL_HOSTNAME and RENDER_EXTERNAL_HOSTNAME not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append(RENDER_EXTERNAL_HOSTNAME)
+
 INSTALLED_APPS = [
     "daphne",
     "django.contrib.admin",
@@ -38,12 +43,14 @@ INSTALLED_APPS = [
     "corsheaders",
     "channels",
     "rest_framework",
+    "drf_spectacular",
     "authentication",
     "detection_ws",
 ]
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -146,6 +153,17 @@ TIME_ZONE = "UTC"
 USE_I18N = True
 USE_TZ = True
 STATIC_URL = "static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
+STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "staticfiles": {
+        "BACKEND": (
+            "django.contrib.staticfiles.storage.StaticFilesStorage"
+            if DEBUG
+            else "whitenoise.storage.CompressedManifestStaticFilesStorage"
+        ),
+    },
+}
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 
@@ -160,6 +178,7 @@ REST_FRAMEWORK = {
         "auth_login": os.getenv("LOGIN_RATE_LIMIT", "5/min"),
     },
     "EXCEPTION_HANDLER": "authentication.exceptions.api_exception_handler",
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
 }
 
 CHANNEL_LAYERS = {
@@ -203,3 +222,27 @@ WEBSOCKET_MAX_IMAGE_SIZE = int(
 WEBSOCKET_MAX_IMAGE_PIXELS = int(os.getenv("WEBSOCKET_MAX_IMAGE_PIXELS", "20000000"))
 DAPHNE_WEBSOCKET_MAX_MESSAGE_SIZE = (WEBSOCKET_MAX_IMAGE_SIZE + 2) // 3 * 4 + 4096
 DAPHNE_WEBSOCKET_MAX_FRAME_SIZE = DAPHNE_WEBSOCKET_MAX_MESSAGE_SIZE
+
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CSRF_TRUSTED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+if RENDER_EXTERNAL_HOSTNAME:
+    CSRF_TRUSTED_ORIGINS.append(f"https://{RENDER_EXTERNAL_HOSTNAME}")
+
+if not DEBUG:
+    # Render terminates TLS and forwards the original scheme in X-Forwarded-Proto.
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "root": {"handlers": ["console"], "level": os.getenv("DJANGO_LOG_LEVEL", "INFO")},
+}
+
+from moramora_api.openapi_settings import SPECTACULAR_SETTINGS  # noqa: E402,F401

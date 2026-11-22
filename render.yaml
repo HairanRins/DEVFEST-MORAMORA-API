@@ -1,0 +1,42 @@
+# Blueprint Render : https://render.com/docs/blueprint-spec
+# Pas de Docker, pas de Redis : runtime Python natif + Neon PostgreSQL.
+services:
+  - type: web
+    name: moramora-api
+    runtime: python
+    # YOLOv8 + PyTorch CPU demandent ~1 Go de RAM : 512 Mo (free/starter)
+    # provoque des redémarrages OOM. "standard" = 2 Go.
+    plan: standard
+    region: frankfurt # proche de Neon eu-central-1
+    branch: main
+    numInstances: 1 # channel layer en mémoire => une seule instance
+    buildCommand: bash moramora_api/scripts/render-build.sh
+    startCommand: bash moramora_api/scripts/render-start.sh
+    healthCheckPath: /api/health/
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: DJANGO_DEBUG
+        value: "false"
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      # URL Neon DIRECTE (avec sslmode=require&channel_binding=require).
+      - key: DATABASE_URL
+        sync: false
+      - key: DJANGO_DB_USE_POOLED
+        value: "false"
+      # URL(s) du frontend, séparées par des virgules (ex. https://moramora.vercel.app)
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: WEBSOCKET_ALLOWED_ORIGINS
+        sync: false
+      - key: LOGIN_RATE_LIMIT
+        value: 5/min
+      # Caches du modèle dans le projet (conservés du build au runtime).
+      - key: HF_HOME
+        value: /opt/render/project/src/.cache/huggingface
+      - key: YOLO_CONFIG_DIR
+        value: /opt/render/project/src/.cache/ultralytics
+      - key: OMP_NUM_THREADS
+        value: "1"

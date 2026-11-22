@@ -6,9 +6,20 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
+from drf_spectacular.utils import OpenApiExample, OpenApiResponse, extend_schema
 from rest_framework_simplejwt.exceptions import AuthenticationFailed
 
 from authentication.models import IssuedAccessToken
+from authentication.openapi import (
+    UNAUTHORIZED,
+    VALIDATION_ERROR,
+    ErrorResponseSerializer,
+    HealthResponseSerializer,
+    LoginResponseSerializer,
+    MessageResponseSerializer,
+    ProfileResponseSerializer,
+    SignupResponseSerializer,
+)
 from authentication.serializers import (
     LoginSerializer,
     ProfileSerializer,
@@ -20,6 +31,27 @@ from authentication.tokens import UnlimitedAccessToken
 User = get_user_model()
 
 
+@extend_schema(
+    tags=["Authentification"],
+    summary="Créer un compte",
+    description="Email et username uniques (insensibles à la casse). "
+    "Le mot de passe doit respecter les validateurs Django.",
+    auth=[],
+    request=SignupSerializer,
+    responses={201: SignupResponseSerializer, 400: VALIDATION_ERROR},
+    examples=[
+        OpenApiExample(
+            "Inscription",
+            request_only=True,
+            value={
+                "username": "john",
+                "email": "john@example.com",
+                "password": "A-strong-password-123!",
+                "password_confirmation": "A-strong-password-123!",
+            },
+        )
+    ],
+)
 class SignupView(APIView):
     permission_classes = (AllowAny,)
 
@@ -42,6 +74,33 @@ class SignupView(APIView):
         )
 
 
+@extend_schema(
+    tags=["Authentification"],
+    summary="Se connecter et obtenir un JWT",
+    description="Renvoie `data.access`, à envoyer ensuite dans "
+    "`Authorization: Bearer <JWT>` (REST) ou comme sous-protocole WebSocket.",
+    auth=[],
+    request=LoginSerializer,
+    responses={
+        200: LoginResponseSerializer,
+        400: VALIDATION_ERROR,
+        401: OpenApiResponse(
+            ErrorResponseSerializer,
+            description="Identifiants invalides ou compte inactif.",
+        ),
+        429: OpenApiResponse(
+            ErrorResponseSerializer,
+            description="Trop de tentatives (LOGIN_RATE_LIMIT).",
+        ),
+    },
+    examples=[
+        OpenApiExample(
+            "Connexion",
+            request_only=True,
+            value={"email": "john@example.com", "password": "A-strong-password-123!"},
+        )
+    ],
+)
 class LoginView(APIView):
     permission_classes = (AllowAny,)
     throttle_classes = (ScopedRateThrottle,)
@@ -82,6 +141,12 @@ class LoginView(APIView):
         )
 
 
+@extend_schema(
+    tags=["Authentification"],
+    summary="Se déconnecter (révoque le JWT courant)",
+    request=None,
+    responses={200: MessageResponseSerializer, 401: UNAUTHORIZED},
+)
 class LogoutView(APIView):
     permission_classes = (IsAuthenticated,)
 
@@ -108,6 +173,11 @@ class LogoutView(APIView):
         )
 
 
+@extend_schema(
+    tags=["Authentification"],
+    summary="Profil de l'utilisateur connecté",
+    responses={200: ProfileResponseSerializer, 401: UNAUTHORIZED},
+)
 class ProfileView(APIView):
     permission_classes = (IsAuthenticated,)
 
@@ -120,3 +190,19 @@ class ProfileView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+class HealthView(APIView):
+    """Liveness probe used by Render; does not touch the database."""
+
+    authentication_classes = ()
+    permission_classes = (AllowAny,)
+
+    @extend_schema(
+        tags=["Système"],
+        summary="État du service",
+        auth=[],
+        responses={200: HealthResponseSerializer},
+    )
+    def get(self, request):
+        return Response({"status": "ok"}, status=status.HTTP_200_OK)

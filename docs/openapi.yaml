@@ -1,0 +1,550 @@
+openapi: 3.0.3
+info:
+  title: MoraMora API
+  version: 1.0.0
+  description: |2
+
+    API **MoraMora** : authentification JWT (REST) et détection d'infractions en
+    temps réel (WebSocket + YOLOv8).
+
+    ## Authentification
+
+    1. `POST /api/auth/signup/` pour créer un compte.
+    2. `POST /api/auth/login/` renvoie `data.access` (JWT HS256 **sans expiration**).
+    3. Envoyer `Authorization: Bearer <JWT>` sur les routes protégées
+       (bouton **Authorize** ci-dessus : coller uniquement le token).
+    4. `POST /api/auth/logout/` révoque immédiatement le token.
+
+    Les erreurs suivent toujours le format
+    `{"success": false, "message": "...", "errors": {...}}`.
+
+    ## WebSocket de détection — `/ws/detection/`
+
+    URL : `wss://<hôte>/ws/detection/` (`ws://localhost:8000/ws/detection/` en local).
+
+    **Connexion**
+
+    - Navigateur : `new WebSocket(url, ["bearer", accessToken])` — le serveur
+      sélectionne le sous-protocole `bearer`.
+    - Autre client : en-tête `Authorization: Bearer <JWT>`.
+    - Un en-tête `Origin` présent dans `WEBSOCKET_ALLOWED_ORIGINS` est obligatoire.
+    - Le JWT dans l'URL (query string) est refusé.
+
+    | Code de fermeture | Cause |
+    | --- | --- |
+    | `4401` | JWT absent, invalide, révoqué ou compte inactif |
+    | `4403` | En-tête `Origin` absent |
+    | `403` (handshake refusé) | Origine non autorisée |
+
+    **Client → serveur** (une image par message)
+
+    - trame binaire contenant un JPEG ou PNG brut ;
+    - ou JSON `WsImageMessage` : `{"type": "image", "image": "<base64 ou data URL>"}`.
+
+    Limites : 5 Mio et 20 mégapixels par image (configurables).
+
+    **Serveur → client**
+
+    - `WsDetectionResult` : image annotée (JPEG base64) + détections ;
+    - `WsAlert` : envoyé juste après le résultat si au moins une détection ;
+    - `WsError` : `code` = `invalid_image` | `busy` | `processing_error`.
+      `busy` signifie qu'une inférence est déjà en cours : réessayer.
+
+    Les schémas de ces messages sont listés dans la section **Schemas** en bas de page.
+
+    ```javascript
+    const socket = new WebSocket("wss://<hôte>/ws/detection/", ["bearer", accessToken]);
+    socket.onopen = () => socket.send(JSON.stringify({ type: "image", image: dataUrl }));
+    socket.onmessage = ({ data }) => {
+      const msg = JSON.parse(data);
+      if (msg.type === "detection_result") show(msg.data.image, msg.data.detections);
+      if (msg.type === "alert") notify(msg.data.detections);
+      if (msg.type === "error") console.warn(msg.code, msg.message);
+    };
+    ```
+paths:
+  /api/auth/login/:
+    post:
+      operationId: auth_login_create
+      description: 'Renvoie `data.access`, à envoyer ensuite dans `Authorization:
+        Bearer <JWT>` (REST) ou comme sous-protocole WebSocket.'
+      summary: Se connecter et obtenir un JWT
+      tags:
+      - Authentification
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            examples:
+              Connexion:
+                value:
+                  email: john@example.com
+                  password: A-strong-password-123!
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: Données invalides.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: Identifiants invalides ou compte inactif.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: Trop de tentatives (LOGIN_RATE_LIMIT).
+  /api/auth/logout/:
+    post:
+      operationId: auth_logout_create
+      summary: Se déconnecter (révoque le JWT courant)
+      tags:
+      - Authentification
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+          description: ''
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: JWT absent, invalide ou révoqué.
+  /api/auth/profile/:
+    get:
+      operationId: auth_profile_retrieve
+      summary: Profil de l'utilisateur connecté
+      tags:
+      - Authentification
+      security:
+      - bearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfileResponse'
+          description: ''
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: JWT absent, invalide ou révoqué.
+  /api/auth/signup/:
+    post:
+      operationId: auth_signup_create
+      description: Email et username uniques (insensibles à la casse). Le mot de passe
+        doit respecter les validateurs Django.
+      summary: Créer un compte
+      tags:
+      - Authentification
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignupRequest'
+            examples:
+              Inscription:
+                value:
+                  username: john
+                  email: john@example.com
+                  password: A-strong-password-123!
+                  password_confirmation: A-strong-password-123!
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/SignupRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/SignupRequest'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignupResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: Données invalides.
+  /api/health/:
+    get:
+      operationId: health_retrieve
+      description: Liveness probe used by Render; does not touch the database.
+      summary: État du service
+      tags:
+      - Système
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+          description: ''
+components:
+  schemas:
+    CodeEnum:
+      type: string
+      enum:
+      - invalid_image
+      - busy
+      - processing_error
+    ErrorResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          default: false
+        message:
+          type: string
+        errors:
+          type: object
+          additionalProperties: {}
+          description: 'Erreurs de validation par champ (ex. {"email": ["..."]}).'
+      required:
+      - message
+    EventEnum:
+      type: string
+      enum:
+      - DETECTION_ALERT
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          default: ok
+    LoginData:
+      type: object
+      properties:
+        access:
+          type: string
+          description: JWT d'accès (Bearer).
+        user:
+          $ref: '#/components/schemas/UserSummary'
+      required:
+      - access
+      - user
+    LoginRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+          minLength: 1
+        password:
+          type: string
+          writeOnly: true
+          minLength: 1
+      required:
+      - email
+      - password
+    LoginResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          default: true
+        message:
+          type: string
+          default: Login successful
+        data:
+          $ref: '#/components/schemas/LoginData'
+      required:
+      - data
+    MessageResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          default: true
+        message:
+          type: string
+      required:
+      - message
+    Profile:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        username:
+          type: string
+          readOnly: true
+          description: Required. 150 characters or fewer. Letters, digits and @/./+/-/_
+            only.
+        email:
+          type: string
+          format: email
+          readOnly: true
+          title: Email address
+        date_joined:
+          type: string
+          format: date-time
+          readOnly: true
+        last_login:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+      required:
+      - date_joined
+      - email
+      - id
+      - last_login
+      - username
+    ProfileResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          default: true
+        message:
+          type: string
+          default: Profile retrieved successfully
+        data:
+          $ref: '#/components/schemas/Profile'
+      required:
+      - data
+    SignupRequest:
+      type: object
+      properties:
+        username:
+          type: string
+          minLength: 1
+          pattern: ^[\w.@+-]+$
+          maxLength: 150
+        email:
+          type: string
+          format: email
+          minLength: 1
+        password:
+          type: string
+          writeOnly: true
+          minLength: 1
+        password_confirmation:
+          type: string
+          writeOnly: true
+          minLength: 1
+      required:
+      - email
+      - password
+      - password_confirmation
+      - username
+    SignupResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          default: true
+        message:
+          type: string
+          default: Signup successful
+        data:
+          $ref: '#/components/schemas/UserSummary'
+      required:
+      - data
+    UserSummary:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        username:
+          type: string
+          description: Required. 150 characters or fewer. Letters, digits and @/./+/-/_
+            only.
+          pattern: ^[\w.@+-]+$
+          maxLength: 150
+        email:
+          type: string
+          format: email
+          title: Email address
+          maxLength: 254
+      required:
+      - email
+      - id
+      - username
+    WsAlert:
+      type: object
+      properties:
+        type:
+          $ref: '#/components/schemas/WsAlertTypeEnum'
+        event:
+          $ref: '#/components/schemas/EventEnum'
+        message:
+          type: string
+          example: A violation has been detected
+        data:
+          type: object
+          properties:
+            detections:
+              type: array
+              items:
+                $ref: '#/components/schemas/WsDetection'
+          required:
+          - detections
+      required:
+      - type
+      - event
+      - message
+      - data
+    WsAlertTypeEnum:
+      type: string
+      enum:
+      - alert
+    WsBoundingBox:
+      type: object
+      properties:
+        x1:
+          type: number
+          format: float
+        y1:
+          type: number
+          format: float
+        x2:
+          type: number
+          format: float
+        y2:
+          type: number
+          format: float
+      required:
+      - x1
+      - y1
+      - x2
+      - y2
+    WsDetection:
+      type: object
+      properties:
+        class_id:
+          type: integer
+          example: 0
+        label:
+          type: string
+          example: no_helmet
+        confidence:
+          type: number
+          format: float
+          example: 0.87
+        bbox:
+          $ref: '#/components/schemas/WsBoundingBox'
+      required:
+      - class_id
+      - label
+      - confidence
+      - bbox
+    WsDetectionResult:
+      type: object
+      properties:
+        type:
+          $ref: '#/components/schemas/WsDetectionResultTypeEnum'
+        success:
+          $ref: '#/components/schemas/WsDetectionResultSuccessEnum'
+        data:
+          type: object
+          properties:
+            image:
+              type: string
+              description: Image annotée, JPEG encodé en base64.
+            detections:
+              type: array
+              items:
+                $ref: '#/components/schemas/WsDetection'
+            message:
+              type: string
+              example: Image processed successfully
+          required:
+          - image
+          - detections
+          - message
+      required:
+      - type
+      - success
+      - data
+    WsDetectionResultSuccessEnum:
+      type: boolean
+      enum:
+      - true
+    WsDetectionResultTypeEnum:
+      type: string
+      enum:
+      - detection_result
+    WsError:
+      type: object
+      properties:
+        type:
+          $ref: '#/components/schemas/WsErrorTypeEnum'
+        success:
+          $ref: '#/components/schemas/WsErrorSuccessEnum'
+        code:
+          $ref: '#/components/schemas/CodeEnum'
+        message:
+          type: string
+      required:
+      - type
+      - success
+      - code
+      - message
+    WsErrorSuccessEnum:
+      type: boolean
+      enum:
+      - false
+    WsErrorTypeEnum:
+      type: string
+      enum:
+      - error
+    WsImageMessage:
+      type: object
+      description: 'Message client → serveur (alternative : trame binaire JPEG/PNG).'
+      properties:
+        type:
+          $ref: '#/components/schemas/WsImageMessageTypeEnum'
+        image:
+          type: string
+          description: Image JPEG/PNG en base64, ou data URL `data:image/jpeg;base64,...`.
+      required:
+      - type
+      - image
+    WsImageMessageTypeEnum:
+      type: string
+      enum:
+      - image
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT obtenu via POST /api/auth/login/ (champ data.access). Sans
+        expiration, révoqué par /api/auth/logout/.
+tags:
+- name: Authentification
+  description: Comptes et JWT.
+- name: Système
+  description: Supervision du service.

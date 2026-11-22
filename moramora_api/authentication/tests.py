@@ -147,3 +147,37 @@ class AuthenticationApiTests(TestCase):
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {second_token}")
         second_response = self.client.get("/api/auth/profile/")
         self.assertEqual(second_response.status_code, 401)
+
+
+class ApiDocumentationTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+
+    def test_health_endpoint(self):
+        response = self.client.get("/api/health/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok"})
+
+    def test_openapi_schema_documents_auth_endpoints(self):
+        response = self.client.get("/api/schema/", {"format": "json"})
+        self.assertEqual(response.status_code, 200)
+        schema = response.json()
+        for path in (
+            "/api/auth/signup/",
+            "/api/auth/login/",
+            "/api/auth/logout/",
+            "/api/auth/profile/",
+            "/api/health/",
+        ):
+            self.assertIn(path, schema["paths"])
+        self.assertEqual(
+            schema["components"]["securitySchemes"]["bearerAuth"]["scheme"],
+            "bearer",
+        )
+        self.assertIn("WsDetectionResult", schema["components"]["schemas"])
+        profile = schema["paths"]["/api/auth/profile/"]["get"]
+        self.assertIn({"bearerAuth": []}, profile["security"])
+
+    def test_swagger_ui_is_served(self):
+        response = self.client.get("/api/docs/")
+        self.assertEqual(response.status_code, 200)
