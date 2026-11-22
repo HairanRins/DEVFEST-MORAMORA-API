@@ -38,6 +38,19 @@ HTTP + WebSocket sur le même port), le **channel layer en mémoire** et la base
 `CSRF_TRUSTED_ORIGINS` incluent automatiquement `RENDER_EXTERNAL_HOSTNAME`.
 Pour un domaine personnalisé, l'ajouter à `DJANGO_ALLOWED_HOSTS`.
 
+## Frontend
+
+`render.yaml` déclare aussi `moramora-frontend` : un site statique (gratuit)
+construit depuis `frontend/`. Lors de la création du Blueprint :
+
+- `VITE_API_URL` = URL du backend, ex. `https://moramora-api.onrender.com` ;
+- côté backend, mettre l'URL du frontend (ex.
+  `https://moramora-frontend.onrender.com`) dans `CORS_ALLOWED_ORIGINS` **et**
+  `WEBSOCKET_ALLOWED_ORIGINS`.
+
+Une modification limitée à `frontend/` ne relance pas le build du backend
+(`buildFilter`).
+
 ## Points d'attention
 
 - **Mémoire** : PyTorch + YOLOv8 dépassent les 512 Mo des plans Free/Starter.

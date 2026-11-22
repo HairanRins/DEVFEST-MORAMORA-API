@@ -8,6 +8,7 @@ Le dépôt contient deux parties :
 | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `moramora_api/` | Projet **Django** : API REST d'authentification (JWT) + **WebSocket** de détection d'infractions en temps réel.                                        |
 | `violation/`    | Moteur d'**IA** : modèle **YOLOv8** (Ultralytics) téléchargé depuis Hugging Face, utilisé par le WebSocket. Contient aussi un script de démo autonome. |
+| `frontend/`     | Interface **React + Vite** : connexion/inscription, envoi d'images ou flux caméra au WebSocket, résultats annotés et alertes. Voir `frontend/README.md`. |
 
 Le serveur tourne en **ASGI** avec **Daphne** (via Django Channels), ce qui permet de servir à la fois HTTP et WebSocket sur le même port (`8000`). Le _channel layer_ de Channels est **en mémoire** (aucun Redis requis), et la base utilisée est **Neon PostgreSQL** via `DATABASE_URL`.
 
@@ -199,6 +200,7 @@ devfest-moramora-api/
 ├── DEPLOIEMENT_RENDER.md             # Guide de déploiement Render
 ├── render.yaml                       # Blueprint Render (service web Python)
 ├── docs/openapi.yaml                 # Export statique du schéma OpenAPI 3
+├── frontend/                         # Interface React + Vite (voir frontend/README.md)
 ├── moramora_api/                     # Projet Django
 │   ├── manage.py                     # CLI Django (migrate, runserver, test…)
 │   ├── requirements.txt              # Dépendances Python
